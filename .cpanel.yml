@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 ---
 deployment:
   tasks:
@@ -17,3 +18,27 @@ deployment:
     # Set proper permissions
     - find $DEPLOYPATH -type f -exec chmod 644 {} \;
     - find $DEPLOYPATH -type d -exec chmod 755 {} \;
+=======
+---
+deployment:
+  tasks:
+    # Set deployment path
+    - export DEPLOYPATH=/home/erkanerd/akaydintarim.com.tr/
+
+    # Install Node.js dependencies
+    - npm install
+
+    # Build the Vite project
+    - npm run build
+
+    # Copy built files to public_html
+    - /bin/cp -R dist/* $DEPLOYPATH
+
+    # Copy server files (if needed)
+    - /bin/cp -R server $DEPLOYPATH/
+    - /bin/cp package.json $DEPLOYPATH/
+
+    # Set proper permissions
+    - find $DEPLOYPATH -type f -exec chmod 644 {} \;
+    - find $DEPLOYPATH -type d -exec chmod 755 {} \;
+>>>>>>> 68783d2deca0c409b8a59fcf054d9efbfbece6e2
