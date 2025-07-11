@@ -1,24 +1,3 @@
-<<<<<<< HEAD
----
-deployment:
-  tasks:
-    # Set deployment path
-    - export DEPLOYPATH=/home/erkanerd/akaydintarim.com.tr/
-
-    # Copy built files to web directory
-    - /bin/cp -R dist/* $DEPLOYPATH
-
-    # Copy server files (backend)
-    - /bin/cp -R server $DEPLOYPATH/
-    - /bin/cp package.json $DEPLOYPATH/
-
-    # Copy database setup
-    - /bin/cp -R database $DEPLOYPATH/
-
-    # Set proper permissions
-    - find $DEPLOYPATH -type f -exec chmod 644 {} \;
-    - find $DEPLOYPATH -type d -exec chmod 755 {} \;
-=======
 ---
 deployment:
   tasks:
@@ -26,19 +5,22 @@ deployment:
     - export DEPLOYPATH=/home/erkanerd/akaydintarim.com.tr/
 
     # Install Node.js dependencies
-    - npm install
+    - npm install --production
 
     # Build the Vite project
     - npm run build
 
-    # Copy built files to public_html
+    # Copy built files to deployment path
     - /bin/cp -R dist/* $DEPLOYPATH
 
-    # Copy server files (if needed)
+    # Copy server files and necessary files
     - /bin/cp -R server $DEPLOYPATH/
     - /bin/cp package.json $DEPLOYPATH/
+    - /bin/cp .env $DEPLOYPATH/
+
+    # Install production dependencies in deployment path
+    - cd $DEPLOYPATH && npm install --production
 
     # Set proper permissions
     - find $DEPLOYPATH -type f -exec chmod 644 {} \;
     - find $DEPLOYPATH -type d -exec chmod 755 {} \;
->>>>>>> 68783d2deca0c409b8a59fcf054d9efbfbece6e2
