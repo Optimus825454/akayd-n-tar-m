@@ -1,18 +1,21 @@
 ---
 deployment:
   tasks:
-    # Copy all files to public_html
-    - export DEPLOYPATH=/home/username/public_html/
-    - /bin/cp -R . $DEPLOYPATH
+    # Set deployment path
+    - export DEPLOYPATH=/home/erkanerd/akaydintarim.com.tr/
 
-    # Install Node.js dependencies (if needed)
-    - cd $DEPLOYPATH && npm install --production
+    # Install Node.js dependencies
+    - npm install
 
-    # Build the project
-    - cd $DEPLOYPATH && npm run build
+    # Build the Vite project
+    - npm run build
 
-    # Copy built files to the correct location
-    - cd $DEPLOYPATH && cp -R dist/* ./
+    # Copy built files to public_html
+    - /bin/cp -R dist/* $DEPLOYPATH
+
+    # Copy server files (if needed)
+    - /bin/cp -R server $DEPLOYPATH/
+    - /bin/cp package.json $DEPLOYPATH/
 
     # Set proper permissions
     - find $DEPLOYPATH -type f -exec chmod 644 {} \;
