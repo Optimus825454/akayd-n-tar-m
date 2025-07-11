@@ -6,7 +6,7 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import axios from 'axios';
-import * as cheerio from 'cheerio';
+// Cheerio'yu lazy import yapacağız
 import cron from 'node-cron';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -904,7 +904,9 @@ app.post('/api/hazelnut-prices/scrape', async (req, res) => {
           timeout: 10000
         });
         
-        const $ = cheerio.load(response.data);
+        // Lazy import cheerio sadece gerektiğinde
+        const { load } = await import('cheerio');
+        const $ = load(response.data);
         
         // Fiyatları bul - sayfa yapısına göre
         let scrapedPrice = null;
@@ -1054,7 +1056,9 @@ const autoScrapeJob = cron.schedule('0 */4 * * *', async () => {
         timeout: 10000
       });
       
-      const $ = cheerio.load(response.data);
+      // Lazy import cheerio sadece gerektiğinde
+      const { load } = await import('cheerio');
+      const $ = load(response.data);
       
       // Fiyat çıkarma (aynı logic scrape endpoint'i ile)
       let scrapedPrice = null;

@@ -4,11 +4,11 @@ deployment:
     # Set deployment path
     - export DEPLOYPATH=/home/erkanerd/akaydintarim.com.tr/
 
-    # Install Node.js dependencies
-    - npm install --production
+    # Install Node.js dependencies with memory optimization
+    - NODE_OPTIONS="--max-old-space-size=128" npm install --production
 
-    # Build the Vite project
-    - npm run build
+    # Build the Vite project with memory optimization
+    - NODE_OPTIONS="--max-old-space-size=256" npm run build
 
     # Copy built files to deployment path
     - /bin/cp -R dist/* $DEPLOYPATH

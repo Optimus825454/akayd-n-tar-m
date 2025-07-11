@@ -7,8 +7,9 @@
     "dev": "concurrently \"npm run server\" \"npm run client\"",
     "client": "vite",
     "server": "nodemon server/index.js",
-    "start": "node --max-old-space-size=256 server/index.js",
-    "start-prod": "node --max-old-space-size=512 server/index.js",
+    "start": "node --max-old-space-size=128 --no-compilation-cache --no-lazy server/index.js",
+    "start-prod": "node --max-old-space-size=256 --no-compilation-cache --no-lazy server/index.js",
+    "start-minimal": "node --max-old-space-size=64 --no-compilation-cache --no-lazy --gc-interval=100 server/index.js",
     "build": "vite build",
     "preview": "vite preview"
   },
