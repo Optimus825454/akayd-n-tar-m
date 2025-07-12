@@ -4,12 +4,15 @@ import cors from 'cors';
 import mysql from 'mysql2/promise';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import crypto from 'crypto';
+
+// Import multer immediately
+import multer from 'multer';
+import cron from 'node-cron';
+import axios from 'axios';
 
 // Only import when needed - lazy loading
-let multer;
 let fs;
-let axios;
-let cron;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -38,22 +41,18 @@ const db = mysql.createPool({
   queueLimit: 0
 });
 
-// Lazy-loaded multer configuration
-const getMulter = async () => {
-  if (!multer) {
-    multer = (await import('multer')).default;
+// Multer configuration
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, path.join(__dirname, '../uploads/'));
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
   }
-  const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-      cb(null, path.join(__dirname, '../uploads/'));
-    },
-    filename: (req, file, cb) => {
-      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-      cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
-    }
-  });
-  return multer({ storage: storage });
-};
+});
+
+const upload = multer({ storage: storage });
 
 // SERVICES API
 app.get('/api/services', async (req, res) => {
@@ -1380,6 +1379,48 @@ const getClientIP = (req) => {
          req.ip;
 };
 
+// Helper function to generate visitor fingerprint
+const generateVisitorFingerprint = (req, additionalData = {}) => {
+  const ip = getClientIP(req);
+  const userAgent = req.get('User-Agent') || '';
+  const acceptLanguage = req.get('Accept-Language') || '';
+  const acceptEncoding = req.get('Accept-Encoding') || '';
+  
+  // Combine multiple factors for fingerprint
+  const fingerprintData = `${ip}|${userAgent}|${acceptLanguage}|${acceptEncoding}|${additionalData.screenResolution || ''}|${additionalData.timezone || ''}|${additionalData.platform || ''}`;
+  
+  // Create a hash of the fingerprint data
+  return crypto.createHash('sha256').update(fingerprintData).digest('hex').substring(0, 32);
+};
+
+// Helper function to check if visitor is unique
+const checkUniqueVisitor = async (fingerprint, sessionId) => {
+  try {
+    // Check if this fingerprint exists in the last 24 hours
+    const [existingVisitor] = await db.execute(
+      `SELECT id, session_id, created_at FROM visitor_sessions 
+       WHERE visitor_fingerprint = ? 
+       AND created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+       ORDER BY created_at DESC LIMIT 1`,
+      [fingerprint]
+    );
+    
+    if (existingVisitor.length > 0) {
+      return {
+        isUnique: false,
+        isNewSession: existingVisitor[0].session_id !== sessionId,
+        lastVisit: existingVisitor[0].created_at,
+        existingSessionId: existingVisitor[0].session_id
+      };
+    }
+    
+    return { isUnique: true, isNewSession: true };
+  } catch (error) {
+    console.error('Unique visitor check error:', error);
+    return { isUnique: true, isNewSession: true }; // Default to unique on error
+  }
+};
+
 // Create visitor session
 app.post('/api/analytics/sessions', async (req, res) => {
   try {
@@ -1394,7 +1435,13 @@ app.post('/api/analytics/sessions', async (req, res) => {
       referrer,
       utm_source,
       utm_medium,
-      utm_campaign
+      utm_campaign,
+      // New fingerprint data
+      screenResolution,
+      timezone,
+      platform,
+      cookieEnabled,
+      language
     } = req.body;
 
     // Validate required parameters
@@ -1403,10 +1450,20 @@ app.post('/api/analytics/sessions', async (req, res) => {
     }
 
     const ip_address = getClientIP(req);
+    
+    // Generate visitor fingerprint
+    const fingerprint = generateVisitorFingerprint(req, {
+      screenResolution,
+      timezone,
+      platform
+    });
+
+    // Check if this is a unique visitor
+    const uniqueCheck = await checkUniqueVisitor(fingerprint, session_id);
 
     // Check if session already exists
     const [existingSessions] = await db.execute(
-      'SELECT id FROM visitor_sessions WHERE session_id = ?',
+      'SELECT id, visitor_fingerprint, is_unique_visitor FROM visitor_sessions WHERE session_id = ?',
       [session_id]
     );
 
@@ -1417,35 +1474,74 @@ app.post('/api/analytics/sessions', async (req, res) => {
          last_activity_at = CURRENT_TIMESTAMP,
          ip_address = COALESCE(ip_address, ?),
          country = COALESCE(country, ?),
-         city = COALESCE(city, ?)
+         city = COALESCE(city, ?),
+         visitor_fingerprint = COALESCE(visitor_fingerprint, ?)
          WHERE session_id = ?`,
-        [ip_address || null, country || null, city || null, session_id]
+        [ip_address || null, country || null, city || null, fingerprint, session_id]
       );
-      res.json({ session_id, updated: true });
+      res.json({ 
+        session_id, 
+        updated: true, 
+        fingerprint,
+        isUniqueVisitor: existingSessions[0].is_unique_visitor,
+        isReturnVisitor: !uniqueCheck.isUnique
+      });
     } else {
-      // Create new session with proper null handling
-      await db.execute(
-        `INSERT INTO visitor_sessions (
-          session_id, ip_address, user_agent, country, city, 
-          device_type, browser, operating_system, referrer,
-          utm_source, utm_medium, utm_campaign
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          session_id,
-          ip_address || null,
-          user_agent || null,
-          country || null,
-          city || null,
-          device_type || null,
-          browser || null,
-          operating_system || null,
-          referrer || null,
-          utm_source || null,
-          utm_medium || null,
-          utm_campaign || null
-        ]
-      );
-      res.json({ session_id, created: true });
+      // Create new session with proper null handling using INSERT IGNORE to prevent duplicates
+      try {
+        await db.execute(
+          `INSERT IGNORE INTO visitor_sessions (
+            session_id, ip_address, user_agent, country, city, 
+            device_type, browser, operating_system, referrer,
+            utm_source, utm_medium, utm_campaign, visitor_fingerprint,
+            is_unique_visitor, is_return_visitor, cookie_enabled, language
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            session_id,
+            ip_address || null,
+            user_agent || null,
+            country || null,
+            city || null,
+            device_type || null,
+            browser || null,
+            operating_system || null,
+            referrer || null,
+            utm_source || null,
+            utm_medium || null,
+            utm_campaign || null,
+            fingerprint,
+            uniqueCheck.isUnique,
+            !uniqueCheck.isUnique,
+            cookieEnabled !== undefined ? cookieEnabled : true,
+            language || null
+          ]
+        );
+        res.json({ 
+          session_id, 
+          created: true, 
+          fingerprint,
+          isUniqueVisitor: uniqueCheck.isUnique,
+          isReturnVisitor: !uniqueCheck.isUnique,
+          lastVisit: uniqueCheck.lastVisit || null
+        });
+      } catch (error) {
+        // If still fails, check if session was created by another request
+        const [checkAgain] = await db.execute(
+          'SELECT id, is_unique_visitor FROM visitor_sessions WHERE session_id = ?',
+          [session_id]
+        );
+        if (checkAgain.length > 0) {
+          res.json({ 
+            session_id, 
+            exists: true, 
+            fingerprint,
+            isUniqueVisitor: checkAgain[0].is_unique_visitor,
+            isReturnVisitor: !uniqueCheck.isUnique
+          });
+        } else {
+          throw error;
+        }
+      }
     }
   } catch (error) {
     console.error('Analytics session error:', error);
@@ -1510,21 +1606,28 @@ app.post('/api/analytics/page-views', async (req, res) => {
     );
 
     if (existingSessions.length === 0) {
-      // Create session if it doesn't exist
+      // Create session if it doesn't exist using INSERT IGNORE to prevent duplicates
       const ip_address = getClientIP(req);
-      await db.execute(
-        `INSERT INTO visitor_sessions (
-          session_id, ip_address, user_agent, device_type, browser, operating_system
-        ) VALUES (?, ?, ?, ?, ?, ?)`,
-        [
-          session_id,
-          ip_address || null,
-          req.get('User-Agent') || null,
-          'unknown',
-          'unknown',
-          'unknown'
-        ]
-      );
+      try {
+        await db.execute(
+          `INSERT IGNORE INTO visitor_sessions (
+            session_id, ip_address, user_agent, device_type, browser, operating_system
+          ) VALUES (?, ?, ?, ?, ?, ?)`,
+          [
+            session_id,
+            ip_address || null,
+            req.get('User-Agent') || null,
+            'unknown',
+            'unknown',
+            'unknown'
+          ]
+        );
+      } catch (error) {
+        // Ignore duplicate key errors as session might have been created by another request
+        if (error.code !== 'ER_DUP_ENTRY') {
+          throw error;
+        }
+      }
     }
 
     // Convert undefined values to null for MySQL compatibility
@@ -1581,21 +1684,28 @@ app.post('/api/analytics/page-views/update', async (req, res) => {
     );
 
     if (existingSessions.length === 0) {
-      // Create session if it doesn't exist
+      // Create session if it doesn't exist using INSERT IGNORE to prevent duplicates
       const ip_address = getClientIP(req);
-      await db.execute(
-        `INSERT INTO visitor_sessions (
-          session_id, ip_address, user_agent, device_type, browser, operating_system
-        ) VALUES (?, ?, ?, ?, ?, ?)`,
-        [
-          session_id,
-          ip_address || null,
-          req.get('User-Agent') || null,
-          'unknown',
-          'unknown',
-          'unknown'
-        ]
-      );
+      try {
+        await db.execute(
+          `INSERT IGNORE INTO visitor_sessions (
+            session_id, ip_address, user_agent, device_type, browser, operating_system
+          ) VALUES (?, ?, ?, ?, ?, ?)`,
+          [
+            session_id,
+            ip_address || null,
+            req.get('User-Agent') || null,
+            'unknown',
+            'unknown',
+            'unknown'
+          ]
+        );
+      } catch (error) {
+        // Ignore duplicate key errors as session might have been created by another request
+        if (error.code !== 'ER_DUP_ENTRY') {
+          throw error;
+        }
+      }
     }
 
     // Update the most recent page view for this session and path
@@ -1925,14 +2035,16 @@ app.get('/api/analytics/debug', async (req, res) => {
 app.get('/api/analytics/dashboard', async (req, res) => {
   try {
     const { from, to } = req.query;
-    const dateFilter = from && to ? 'AND DATE(first_visit_at) BETWEEN ? AND ?' : '';
+    const dateFilter = from && to ? 'AND DATE(created_at) BETWEEN ? AND ?' : '';
     const dateParams = from && to ? [from, to] : [];
 
-    // Basic stats
+    // Basic stats with unique visitor tracking
     const [sessionStats] = await db.execute(
       `SELECT 
         COUNT(*) as total_sessions,
-        COUNT(DISTINCT ip_address) as unique_visitors,
+        COUNT(DISTINCT visitor_fingerprint) as unique_visitors,
+        SUM(CASE WHEN is_unique_visitor = 1 THEN 1 ELSE 0 END) as new_visitors,
+        SUM(CASE WHEN is_return_visitor = 1 THEN 1 ELSE 0 END) as return_visitors,
         AVG(session_duration) as avg_session_duration,
         SUM(CASE WHEN is_bounce THEN 1 ELSE 0 END) / COUNT(*) * 100 as bounce_rate
        FROM visitor_sessions 
@@ -1948,9 +2060,22 @@ app.get('/api/analytics/dashboard', async (req, res) => {
       dateParams
     );
 
+    // Unique visitors by day (last 7 days)
+    const [dailyUniqueVisitors] = await db.execute(
+      `SELECT 
+        DATE(created_at) as date,
+        COUNT(DISTINCT visitor_fingerprint) as unique_visitors
+       FROM visitor_sessions 
+       WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+       GROUP BY DATE(created_at)
+       ORDER BY date DESC`
+    );
+
     // Device stats
     const [deviceStats] = await db.execute(
-      `SELECT device_type, COUNT(*) as count
+      `SELECT device_type, 
+        COUNT(*) as sessions,
+        COUNT(DISTINCT visitor_fingerprint) as unique_visitors
        FROM visitor_sessions 
        WHERE 1=1 ${dateFilter}
        GROUP BY device_type`,
@@ -2491,6 +2616,164 @@ app.get('/api/analytics/device-breakdown', async (req, res) => {
   }
 });
 
+// Get unique visitor stats
+app.get('/api/analytics/unique-visitors', async (req, res) => {
+  try {
+    const { from, to, groupBy = 'day' } = req.query;
+    const dateFilter = from && to ? 'AND DATE(created_at) BETWEEN ? AND ?' : '';
+    const dateParams = from && to ? [from, to] : [];
+    
+    let groupByClause;
+    switch(groupBy) {
+      case 'hour':
+        groupByClause = 'DATE_FORMAT(created_at, "%Y-%m-%d %H:00:00")';
+        break;
+      case 'week':
+        groupByClause = 'YEARWEEK(created_at)';
+        break;
+      case 'month':
+        groupByClause = 'DATE_FORMAT(created_at, "%Y-%m")';
+        break;
+      default:
+        groupByClause = 'DATE(created_at)';
+    }
+
+    const [uniqueVisitorStats] = await db.execute(
+      `SELECT 
+        ${groupByClause} as period,
+        COUNT(DISTINCT visitor_fingerprint) as unique_visitors,
+        SUM(CASE WHEN is_unique_visitor = 1 THEN 1 ELSE 0 END) as new_visitors,
+        SUM(CASE WHEN is_return_visitor = 1 THEN 1 ELSE 0 END) as return_visitors,
+        COUNT(*) as total_sessions
+       FROM visitor_sessions 
+       WHERE 1=1 ${dateFilter}
+       GROUP BY ${groupByClause}
+       ORDER BY period DESC`,
+      dateParams
+    );
+
+    res.json(uniqueVisitorStats);
+  } catch (error) {
+    console.error('Unique visitor stats error:', error);
+    res.status(500).json({ error: 'Unique ziyaretçi istatistikleri alınırken hata oluştu' });
+  }
+});
+
+// Get visitor fingerprint details
+app.get('/api/analytics/visitor-fingerprints', async (req, res) => {
+  try {
+    const { limit = 100 } = req.query;
+    
+    const [fingerprints] = await db.execute(
+      `SELECT 
+        visitor_fingerprint,
+        COUNT(*) as session_count,
+        MIN(created_at) as first_visit,
+        MAX(last_activity_at) as last_visit,
+        COUNT(DISTINCT DATE(created_at)) as visit_days,
+        GROUP_CONCAT(DISTINCT device_type) as devices,
+        GROUP_CONCAT(DISTINCT browser) as browsers
+       FROM visitor_sessions 
+       WHERE visitor_fingerprint IS NOT NULL
+       GROUP BY visitor_fingerprint
+       ORDER BY session_count DESC, last_visit DESC
+       LIMIT ?`,
+      [parseInt(limit)]
+    );
+
+    res.json(fingerprints);
+  } catch (error) {
+    console.error('Visitor fingerprints error:', error);
+    res.status(500).json({ error: 'Ziyaretçi parmak izleri alınırken hata oluştu' });
+  }
+});
+
+// Check if visitor is returning
+app.post('/api/analytics/check-returning-visitor', async (req, res) => {
+  try {
+    const { fingerprint, sessionId } = req.body;
+    
+    if (!fingerprint) {
+      return res.status(400).json({ error: 'Fingerprint gerekli' });
+    }
+
+    const uniqueCheck = await checkUniqueVisitor(fingerprint, sessionId);
+    
+    res.json({
+      isUniqueVisitor: uniqueCheck.isUnique,
+      isReturnVisitor: !uniqueCheck.isUnique,
+      lastVisit: uniqueCheck.lastVisit,
+      isNewSession: uniqueCheck.isNewSession
+    });
+  } catch (error) {
+    console.error('Check returning visitor error:', error);
+    res.status(500).json({ error: 'Returning visitor kontrolü yapılırken hata oluştu' });
+  }
+});
+
+// Get visitor journey by fingerprint
+app.get('/api/analytics/visitor-journey/:fingerprint', async (req, res) => {
+  try {
+    const { fingerprint } = req.params;
+    
+    // Get all sessions for this fingerprint
+    const [sessions] = await db.execute(
+      `SELECT 
+        vs.session_id,
+        vs.created_at,
+        vs.last_activity_at,
+        vs.session_duration,
+        vs.total_page_views,
+        vs.device_type,
+        vs.browser,
+        vs.country,
+        vs.city,
+        vs.referrer,
+        vs.utm_source,
+        vs.utm_medium,
+        vs.utm_campaign
+       FROM visitor_sessions vs
+       WHERE vs.visitor_fingerprint = ?
+       ORDER BY vs.created_at DESC`,
+      [fingerprint]
+    );
+
+    // Get page views for these sessions
+    const sessionIds = sessions.map(s => s.session_id);
+    let pageViews = [];
+    
+    if (sessionIds.length > 0) {
+      const placeholders = sessionIds.map(() => '?').join(',');
+      const [pvRows] = await db.execute(
+        `SELECT 
+          pv.session_id,
+          pv.page_path,
+          pv.page_title,
+          pv.viewed_at,
+          pv.time_on_page,
+          pv.scroll_percentage
+         FROM page_views pv
+         WHERE pv.session_id IN (${placeholders})
+         ORDER BY pv.viewed_at ASC`,
+        sessionIds
+      );
+      pageViews = pvRows;
+    }
+
+    res.json({
+      fingerprint,
+      sessions,
+      pageViews,
+      totalSessions: sessions.length,
+      firstVisit: sessions.length > 0 ? sessions[sessions.length - 1].created_at : null,
+      lastVisit: sessions.length > 0 ? sessions[0].last_activity_at : null
+    });
+  } catch (error) {
+    console.error('Visitor journey error:', error);
+    res.status(500).json({ error: 'Ziyaretçi yolculuğu alınırken hata oluştu' });
+  }
+});
+
 // Cleanup old data
 app.post('/api/analytics/cleanup', async (req, res) => {
   try {
@@ -2505,6 +2788,580 @@ app.post('/api/analytics/cleanup', async (req, res) => {
   } catch (error) {
     console.error('Cleanup error:', error);
     res.status(500).json({ error: 'Veri temizlenirken hata oluştu' });
+  }
+});
+
+// ACTIVE VISITORS API - Aktif Ziyaretçiler
+// =====================================
+
+// Get active visitors (last 5 minutes)
+app.get('/api/analytics/active-visitors', async (req, res) => {
+  try {
+    const [activeVisitors] = await db.execute(`
+      SELECT DISTINCT
+        vs.session_id,
+        vs.ip_address,
+        vs.country,
+        vs.city,
+        vs.device_type,
+        vs.browser,
+        vs.operating_system,
+        vs.visitor_fingerprint,
+        vs.is_return_visitor,
+        vs.created_at as first_visit,
+        vs.last_activity_at,
+        COALESCE(pv.current_page, '/') as current_page,
+        COALESCE(pv.page_title, 'Ana Sayfa') as current_page_title,
+        TIMESTAMPDIFF(SECOND, vs.created_at, NOW()) as session_duration,
+        vs.total_page_views,
+        pv.viewed_at as last_page_view
+      FROM visitor_sessions vs
+      LEFT JOIN (
+        SELECT session_id, page_path as current_page, page_title, viewed_at,
+               ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY viewed_at DESC) as rn
+        FROM page_views 
+        WHERE viewed_at > DATE_SUB(NOW(), INTERVAL 5 MINUTE)
+      ) pv ON vs.session_id = pv.session_id AND pv.rn = 1
+      WHERE vs.last_activity_at > DATE_SUB(NOW(), INTERVAL 5 MINUTE)
+      ORDER BY vs.last_activity_at DESC
+    `);
+
+    res.json(activeVisitors);
+  } catch (error) {
+    console.error('Active visitors error:', error);
+    res.status(500).json({ error: 'Aktif ziyaretçiler alınırken hata oluştu' });
+  }
+});
+
+// Update visitor activity (heartbeat)
+app.post('/api/analytics/heartbeat', async (req, res) => {
+  try {
+    const { session_id, current_page, page_title } = req.body;
+
+    if (!session_id) {
+      return res.status(400).json({ error: 'session_id gerekli' });
+    }
+
+    // Update last activity time
+    await db.execute(
+      'UPDATE visitor_sessions SET last_activity_at = CURRENT_TIMESTAMP WHERE session_id = ?',
+      [session_id]
+    );
+
+    // Update current page if provided
+    if (current_page) {
+      await db.execute(`
+        INSERT INTO page_views (session_id, page_path, page_title, viewed_at)
+        VALUES (?, ?, ?, NOW())
+        ON DUPLICATE KEY UPDATE 
+          page_title = VALUES(page_title),
+          viewed_at = NOW()
+      `, [session_id, current_page, page_title || '']);
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Heartbeat error:', error);
+    res.status(500).json({ error: 'Heartbeat güncellenirken hata oluştu' });
+  }
+});
+
+// Get visitor details by session
+app.get('/api/analytics/visitor/:sessionId', async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+
+    const [visitor] = await db.execute(`
+      SELECT 
+        vs.*,
+        COUNT(DISTINCT pv.page_path) as unique_pages_visited,
+        GROUP_CONCAT(DISTINCT pv.page_path ORDER BY pv.viewed_at DESC SEPARATOR '||') as page_journey
+      FROM visitor_sessions vs
+      LEFT JOIN page_views pv ON vs.session_id = pv.session_id
+      WHERE vs.session_id = ?
+      GROUP BY vs.id
+    `, [sessionId]);
+
+    if (visitor.length === 0) {
+      return res.status(404).json({ error: 'Ziyaretçi bulunamadı' });
+    }
+
+    // Parse page journey
+    if (visitor[0].page_journey) {
+      visitor[0].page_journey = visitor[0].page_journey.split('||');
+    } else {
+      visitor[0].page_journey = [];
+    }
+
+    res.json(visitor[0]);
+  } catch (error) {
+    console.error('Visitor details error:', error);
+    res.status(500).json({ error: 'Ziyaretçi detayları alınırken hata oluştu' });
+  }
+});
+
+// Get real-time statistics for dashboard
+app.get('/api/analytics/realtime-stats', async (req, res) => {
+  try {
+    // Active visitors (last 5 minutes)
+    const [activeCount] = await db.execute(`
+      SELECT COUNT(DISTINCT session_id) as active_visitors
+      FROM visitor_sessions 
+      WHERE last_activity_at > DATE_SUB(NOW(), INTERVAL 5 MINUTE)
+    `);
+
+    // Today's unique visitors
+    const [todayUnique] = await db.execute(`
+      SELECT COUNT(DISTINCT visitor_fingerprint) as todays_unique
+      FROM visitor_sessions 
+      WHERE DATE(created_at) = CURDATE()
+    `);
+
+    // Current page views (last 30 minutes)
+    const [currentPageViews] = await db.execute(`
+      SELECT page_path, page_title, COUNT(*) as views
+      FROM page_views 
+      WHERE viewed_at > DATE_SUB(NOW(), INTERVAL 30 MINUTE)
+      GROUP BY page_path, page_title
+      ORDER BY views DESC
+      LIMIT 10
+    `);
+
+    // Top referrers today
+    const [topReferrers] = await db.execute(`
+      SELECT referrer, COUNT(*) as count
+      FROM visitor_sessions 
+      WHERE DATE(created_at) = CURDATE() AND referrer IS NOT NULL AND referrer != ''
+      GROUP BY referrer
+      ORDER BY count DESC
+      LIMIT 5
+    `);
+
+    res.json({
+      active_visitors: activeCount[0].active_visitors,
+      todays_unique_visitors: todayUnique[0].todays_unique,
+      current_popular_pages: currentPageViews,
+      top_referrers: topReferrers,
+      last_updated: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Realtime stats error:', error);
+    res.status(500).json({ error: 'Gerçek zamanlı istatistikler alınırken hata oluştu' });
+  }
+});
+
+// Get visitor geographic distribution
+app.get('/api/analytics/geographic-distribution', async (req, res) => {
+  try {
+    const [countries] = await db.execute(`
+      SELECT 
+        country,
+        city,
+        COUNT(DISTINCT visitor_fingerprint) as unique_visitors,
+        COUNT(*) as total_sessions
+      FROM visitor_sessions 
+      WHERE created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
+        AND country IS NOT NULL AND country != ''
+      GROUP BY country, city
+      ORDER BY unique_visitors DESC
+      LIMIT 20
+    `);
+
+    res.json(countries);
+  } catch (error) {
+    console.error('Geographic distribution error:', error);
+    res.status(500).json({ error: 'Coğrafi dağılım alınırken hata oluştu' });
+  }
+});
+
+// =====================================
+// REAL-TIME ACTIVE VISITORS API
+// =====================================
+
+// Start visitor session (Real-time tracking)
+app.post('/api/analytics/realtime/start-session', async (req, res) => {
+  try {
+    const {
+      session_id,
+      visitor_fingerprint,
+      user_agent,
+      device_type,
+      browser,
+      operating_system,
+      country,
+      city,
+      current_page,
+      page_title,
+      referrer,
+      utm_source,
+      utm_medium,
+      utm_campaign
+    } = req.body;
+
+    if (!session_id) {
+      return res.status(400).json({ error: 'session_id gerekli' });
+    }
+
+    const ip_address = getClientIP(req);
+    
+    // Check if this is a returning visitor by fingerprint
+    let isNewVisitor = true;
+    let isReturnVisitor = false;
+    
+    if (visitor_fingerprint) {
+      const [existingVisitor] = await db.execute(
+        'SELECT id FROM active_visitors_realtime WHERE visitor_fingerprint = ? AND first_visit_time < DATE_SUB(NOW(), INTERVAL 1 HOUR)',
+        [visitor_fingerprint]
+      );
+      
+      if (existingVisitor.length > 0) {
+        isNewVisitor = false;
+        isReturnVisitor = true;
+      }
+    }
+
+    // Insert or update active visitor
+    await db.execute(`
+      INSERT INTO active_visitors_realtime (
+        session_id, visitor_fingerprint, ip_address, user_agent,
+        device_type, browser, operating_system, country, city,
+        current_page, current_page_title, entry_page,
+        is_new_visitor, is_return_visitor, referrer,
+        utm_source, utm_medium, utm_campaign,
+        session_start_time, last_activity_time, last_heartbeat
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW(), NOW())
+      ON DUPLICATE KEY UPDATE
+        current_page = VALUES(current_page),
+        current_page_title = VALUES(current_page_title),
+        last_activity_time = NOW(),
+        last_heartbeat = NOW(),
+        heartbeat_count = heartbeat_count + 1,
+        is_active = TRUE
+    `, [
+      session_id,
+      visitor_fingerprint || null,
+      ip_address || null,
+      user_agent || null,
+      device_type || 'desktop',
+      browser || null,
+      operating_system || null,
+      country || null,
+      city || null,
+      current_page || '/',
+      page_title || null,
+      current_page || '/', // entry_page
+      isNewVisitor,
+      isReturnVisitor,
+      referrer || null,
+      utm_source || null,
+      utm_medium || null,
+      utm_campaign || null
+    ]);
+
+    // Track initial page view
+    await db.execute(`
+      INSERT INTO realtime_page_views (
+        session_id, page_path, page_title, referrer, entry_time
+      ) VALUES (?, ?, ?, ?, NOW())
+      ON DUPLICATE KEY UPDATE
+        last_update_time = NOW()
+    `, [session_id, current_page || '/', page_title || null, referrer || null]);
+
+    res.json({ 
+      success: true, 
+      session_id,
+      is_new_visitor: isNewVisitor,
+      is_return_visitor: isReturnVisitor
+    });
+  } catch (error) {
+    console.error('Start session error:', error);
+    res.status(500).json({ error: 'Oturum başlatılırken hata oluştu' });
+  }
+});
+
+// Update visitor heartbeat (5 saniyede bir çağrılır)
+app.post('/api/analytics/realtime/heartbeat', async (req, res) => {
+  try {
+    const { 
+      session_id, 
+      current_page, 
+      page_title, 
+      time_on_page,
+      scroll_percentage,
+      clicks_count,
+      mouse_movements 
+    } = req.body;
+
+    if (!session_id) {
+      return res.status(400).json({ error: 'session_id gerekli' });
+    }
+
+    // Update visitor activity
+    const [result] = await db.execute(`
+      UPDATE active_visitors_realtime 
+      SET 
+        current_page = COALESCE(?, current_page),
+        current_page_title = COALESCE(?, current_page_title),
+        last_activity_time = NOW(),
+        last_heartbeat = NOW(),
+        heartbeat_count = heartbeat_count + 1,
+        session_duration = TIMESTAMPDIFF(SECOND, session_start_time, NOW()),
+        total_time_on_site = total_time_on_site + 5,
+        is_active = TRUE
+      WHERE session_id = ?
+    `, [current_page, page_title, session_id]);
+
+    // Update current page view
+    if (current_page) {
+      await db.execute(`
+        UPDATE realtime_page_views 
+        SET 
+          last_update_time = NOW(),
+          time_on_page = COALESCE(?, time_on_page),
+          scroll_percentage = GREATEST(COALESCE(?, 0), scroll_percentage),
+          clicks_count = clicks_count + COALESCE(?, 0),
+          mouse_movements = mouse_movements + COALESCE(?, 0)
+        WHERE session_id = ? AND page_path = ?
+        ORDER BY entry_time DESC LIMIT 1
+      `, [time_on_page, scroll_percentage, clicks_count, mouse_movements, session_id, current_page]);
+    }
+
+    res.json({ success: true, heartbeat_received: true });
+  } catch (error) {
+    console.error('Heartbeat error:', error);
+    res.status(500).json({ error: 'Heartbeat güncellenirken hata oluştu' });
+  }
+});
+
+// Track page change
+app.post('/api/analytics/realtime/page-change', async (req, res) => {
+  try {
+    const { 
+      session_id, 
+      previous_page,
+      new_page, 
+      page_title, 
+      time_on_previous_page 
+    } = req.body;
+
+    if (!session_id || !new_page) {
+      return res.status(400).json({ error: 'session_id ve new_page gerekli' });
+    }
+
+    // Mark previous page as exit page
+    if (previous_page) {
+      await db.execute(`
+        UPDATE realtime_page_views 
+        SET 
+          is_exit_page = TRUE,
+          exit_time = NOW(),
+          time_on_page = COALESCE(?, time_on_page)
+        WHERE session_id = ? AND page_path = ?
+        ORDER BY entry_time DESC LIMIT 1
+      `, [time_on_previous_page, session_id, previous_page]);
+    }
+
+    // Update visitor current page
+    await db.execute(`
+      UPDATE active_visitors_realtime 
+      SET 
+        previous_page = current_page,
+        current_page = ?,
+        current_page_title = ?,
+        last_activity_time = NOW(),
+        total_page_views = total_page_views + 1
+      WHERE session_id = ?
+    `, [new_page, page_title, session_id]);
+
+    // Add new page view
+    await db.execute(`
+      INSERT INTO realtime_page_views (
+        session_id, page_path, page_title, entry_time
+      ) VALUES (?, ?, ?, NOW())
+    `, [session_id, new_page, page_title || null]);
+
+    res.json({ success: true, page_changed: true });
+  } catch (error) {
+    console.error('Page change error:', error);
+    res.status(500).json({ error: 'Sayfa değişimi kaydedilirken hata oluştu' });
+  }
+});
+
+// End visitor session
+app.post('/api/analytics/realtime/end-session', async (req, res) => {
+  try {
+    const { session_id, final_page, time_on_final_page } = req.body;
+
+    if (!session_id) {
+      return res.status(400).json({ error: 'session_id gerekli' });
+    }
+
+    // Mark visitor as inactive
+    await db.execute(`
+      UPDATE active_visitors_realtime 
+      SET 
+        is_active = FALSE,
+        session_duration = TIMESTAMPDIFF(SECOND, session_start_time, NOW())
+      WHERE session_id = ?
+    `, [session_id]);
+
+    // Mark final page as exit page
+    if (final_page) {
+      await db.execute(`
+        UPDATE realtime_page_views 
+        SET 
+          is_exit_page = TRUE,
+          exit_time = NOW(),
+          time_on_page = COALESCE(?, time_on_page)
+        WHERE session_id = ? AND page_path = ?
+        ORDER BY entry_time DESC LIMIT 1
+      `, [time_on_final_page, session_id, final_page]);
+    }
+
+    res.json({ success: true, session_ended: true });
+  } catch (error) {
+    console.error('End session error:', error);
+    res.status(500).json({ error: 'Oturum sonlandırılırken hata oluştu' });
+  }
+});
+
+// Get real-time active visitors
+app.get('/api/analytics/realtime/active-visitors', async (req, res) => {
+  try {
+    const [activeVisitors] = await db.execute(`
+      SELECT 
+        av.session_id,
+        av.visitor_fingerprint,
+        av.ip_address,
+        av.device_type,
+        av.browser,
+        av.operating_system,
+        av.country,
+        av.city,
+        av.current_page,
+        av.current_page_title,
+        av.is_new_visitor,
+        av.is_return_visitor,
+        av.session_start_time as first_visit,
+        av.last_activity_time as last_activity_at,
+        av.session_duration,
+        av.total_page_views,
+        av.heartbeat_count,
+        av.referrer,
+        TIMESTAMPDIFF(SECOND, av.last_heartbeat, NOW()) as seconds_since_heartbeat
+      FROM active_visitors_realtime av
+      WHERE av.is_active = TRUE 
+        AND av.last_heartbeat > DATE_SUB(NOW(), INTERVAL 2 MINUTE)
+      ORDER BY av.last_activity_time DESC
+    `);
+
+    res.json({
+      active_visitors: activeVisitors,
+      total_active: activeVisitors.length,
+      last_updated: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Active visitors error:', error);
+    res.status(500).json({ error: 'Aktif ziyaretçiler alınırken hata oluştu' });
+  }
+});
+
+// Get real-time statistics
+app.get('/api/analytics/realtime/stats', async (req, res) => {
+  try {
+    // Active visitors count
+    const [activeCount] = await db.execute(`
+      SELECT COUNT(*) as count 
+      FROM active_visitors_realtime 
+      WHERE is_active = TRUE AND last_heartbeat > DATE_SUB(NOW(), INTERVAL 2 MINUTE)
+    `);
+
+    // New vs returning visitors
+    const [visitorTypes] = await db.execute(`
+      SELECT 
+        SUM(CASE WHEN is_new_visitor = TRUE THEN 1 ELSE 0 END) as new_visitors,
+        SUM(CASE WHEN is_return_visitor = TRUE THEN 1 ELSE 0 END) as return_visitors
+      FROM active_visitors_realtime 
+      WHERE is_active = TRUE AND last_heartbeat > DATE_SUB(NOW(), INTERVAL 2 MINUTE)
+    `);
+
+    // Device breakdown
+    const [deviceStats] = await db.execute(`
+      SELECT 
+        device_type,
+        COUNT(*) as count
+      FROM active_visitors_realtime 
+      WHERE is_active = TRUE AND last_heartbeat > DATE_SUB(NOW(), INTERVAL 2 MINUTE)
+      GROUP BY device_type
+    `);
+
+    // Current popular pages
+    const [popularPages] = await db.execute(`
+      SELECT 
+        current_page,
+        current_page_title,
+        COUNT(*) as visitors
+      FROM active_visitors_realtime 
+      WHERE is_active = TRUE AND last_heartbeat > DATE_SUB(NOW(), INTERVAL 2 MINUTE)
+      GROUP BY current_page, current_page_title
+      ORDER BY visitors DESC
+      LIMIT 10
+    `);
+
+    // Geographic distribution
+    const [geoStats] = await db.execute(`
+      SELECT 
+        country,
+        city,
+        COUNT(*) as visitors
+      FROM active_visitors_realtime 
+      WHERE is_active = TRUE 
+        AND last_heartbeat > DATE_SUB(NOW(), INTERVAL 2 MINUTE)
+        AND country IS NOT NULL
+      GROUP BY country, city
+      ORDER BY visitors DESC
+      LIMIT 10
+    `);
+
+    const deviceBreakdown = {};
+    deviceStats.forEach(stat => {
+      deviceBreakdown[stat.device_type] = stat.count;
+    });
+
+    res.json({
+      total_active_visitors: activeCount[0].count,
+      new_visitors: visitorTypes[0].new_visitors || 0,
+      return_visitors: visitorTypes[0].return_visitors || 0,
+      device_breakdown: deviceBreakdown,
+      popular_pages: popularPages,
+      geographic_distribution: geoStats,
+      last_updated: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Realtime stats error:', error);
+    res.status(500).json({ error: 'Gerçek zamanlı istatistikler alınırken hata oluştu' });
+  }
+});
+
+// Manual cleanup inactive visitors
+app.post('/api/analytics/realtime/cleanup', async (req, res) => {
+  try {
+    await db.execute('CALL CleanupInactiveVisitors()');
+    res.json({ success: true, message: 'Inactive visitors cleaned up' });
+  } catch (error) {
+    console.error('Cleanup error:', error);
+    res.status(500).json({ error: 'Temizlik işlemi sırasında hata oluştu' });
+  }
+});
+
+// Create test active visitors
+app.post('/api/analytics/realtime/create-test-data', async (req, res) => {
+  try {
+    await db.execute('CALL CreateTestActiveVisitors()');
+    res.json({ success: true, message: 'Test active visitors created' });
+  } catch (error) {
+    console.error('Test data creation error:', error);
+    res.status(500).json({ error: 'Test verisi oluşturulurken hata oluştu' });
   }
 });
 

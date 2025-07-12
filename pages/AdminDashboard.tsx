@@ -16,6 +16,7 @@ import AboutManagement from '../components/admin/AboutManagement';
 import SEOManagement from '../components/admin/SEOManagement';
 import AnalyticsManagement from '../components/admin/AnalyticsManagement';
 import RealTimeAnalytics from '../components/admin/RealTimeAnalytics';
+import ActiveVisitorsManagement from '../components/admin/ActiveVisitorsManagement';
 
 interface AdminDashboardProps {
     services: Service[];
@@ -126,6 +127,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
     const menuItems = [
         { id: 'dashboard', name: 'Kontrol Paneli', icon: '📊' },
         { id: 'realtime', name: 'Anlık İstatistikler', icon: '🔴' },
+        { id: 'active-visitors', name: 'Aktif Ziyaretçiler', icon: '👥' },
         { id: 'analytics', name: 'Ziyaretçi Analitikleri', icon: '📈' },
         { id: 'hero', name: 'Ana Sayfa Hero', icon: '🎬' },
         { id: 'services', name: 'Hizmetler', icon: '🛠️' },
@@ -207,6 +209,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
                             <p className="text-gray-600">
                                 {activeSection === 'dashboard' && 'Sistem durumunuz ve genel istatistikler'}
                                 {activeSection === 'realtime' && 'Anlık ziyaretçi hareketleri ve canlı istatistikler'}
+                                {activeSection === 'active-visitors' && 'Şu anda sitede aktif olan ziyaretçiler ve hareketleri'}
                                 {activeSection === 'analytics' && 'Ziyaretçi analitikleri ve davranış raporları'}
                                 {activeSection === 'services' && 'Hizmetlerinizi yönetin'}
                                 {activeSection === 'products' && 'Ürünlerinizi düzenleyin'}
@@ -317,6 +320,10 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
                     {activeSection === 'contact-messages' && (
                         <ContactMessagesManagement />
+                    )}
+
+                    {activeSection === 'active-visitors' && (
+                        <ActiveVisitorsManagement />
                     )}
 
                     {activeSection === 'analytics' && (
