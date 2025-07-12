@@ -3,7 +3,7 @@ const mysql = require('mysql2/promise');
 const cors = require('cors');
 
 const app = express();
-const PORT = process.env.PORT || 3003;
+const PORT = process.env.PORT || 3000;
 
 // Minimal middleware
 app.use(cors());
@@ -15,9 +15,9 @@ async function connectDB() {
   try {
     db = await mysql.createConnection({
       host: process.env.DB_HOST || 'localhost',
-      user: process.env.DB_USER || 'akaydin',
+      user: process.env.DB_USER || 'erkanerd_akaydin',
       password: process.env.DB_PASSWORD || '518518',
-      database: process.env.DB_NAME || 'akaydin_tarim'
+      database: process.env.DB_NAME || 'erkanerd_akaydin_tarim'
     });
     console.log('Database connected successfully');
   } catch (error) {
@@ -63,17 +63,30 @@ app.get('/', (req, res) => {
   res.json({ message: 'Akaydın Tarım API Server Running' });
 });
 
-// Start server
+// Start server with error handling
 async function startServer() {
   try {
     await connectDB();
-    app.listen(PORT, () => {
+    
+    const server = app.listen(PORT, () => {
       console.log(`Ultra minimal server running on port ${PORT}`);
       console.log(`Node version: ${process.version}`);
       console.log(`Memory usage:`, process.memoryUsage());
     });
+    
+    // Handle port conflict
+    server.on('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        console.log(`Port ${PORT} is busy, trying ${PORT + 1}`);
+        server.listen(PORT + 1);
+      } else {
+        console.error('Server error:', err);
+      }
+    });
+    
   } catch (error) {
     console.error('Server startup error:', error);
+    process.exit(1);
   }
 }
 
