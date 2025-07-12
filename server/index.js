@@ -1,13 +1,15 @@
+// Memory-optimized imports
 import express from 'express';
 import cors from 'cors';
 import mysql from 'mysql2/promise';
-import multer from 'multer';
 import path from 'path';
-import fs from 'fs';
 import { fileURLToPath } from 'url';
-import axios from 'axios';
-// Cheerio'yu lazy import yapacağız
-import cron from 'node-cron';
+
+// Only import when needed - lazy loading
+let multer;
+let fs;
+let axios;
+let cron;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -36,18 +38,22 @@ const db = mysql.createPool({
   queueLimit: 0
 });
 
-// Multer yapılandırması (görsel yükleme için)
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, path.join(__dirname, '../uploads/'));
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+// Lazy-loaded multer configuration
+const getMulter = async () => {
+  if (!multer) {
+    multer = (await import('multer')).default;
   }
-});
-
-const upload = multer({ storage: storage });
+  const storage = multer.diskStorage({
+    destination: (req, file, cb) => {
+      cb(null, path.join(__dirname, '../uploads/'));
+    },
+    filename: (req, file, cb) => {
+      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+      cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+    }
+  });
+  return multer({ storage: storage });
+};
 
 // SERVICES API
 app.get('/api/services', async (req, res) => {
