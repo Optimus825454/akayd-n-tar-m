@@ -1,6 +1,7 @@
 {
-  "name": "akaydin-tarim-hosting",
+  "name": "akaydin-tarim-ultra-minimal",
   "version": "1.0.0",
+  "description": "Ultra minimal CommonJS server for Node.js 16",
   "engines": {
     "node": ">=16.0.0"
   },
