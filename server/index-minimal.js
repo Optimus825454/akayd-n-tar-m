@@ -1,4 +1,4 @@
-// Minimal memory-optimized server startup
+// Minimal memory-optimized server for Node.js 16+
 import express from 'express';
 import cors from 'cors';
 import mysql from 'mysql2/promise';
@@ -11,25 +11,25 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3003;
 
-// Minimal middleware
+// Very minimal middleware
 app.use(cors({
-  origin: true,
-  credentials: true
+  origin: "*",
+  credentials: false
 }));
-app.use(express.json({ limit: '1mb' }));
-app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
+app.use(express.json({ limit: '100kb' }));
 
-// MySQL connection with environment variables
+// MySQL connection with reduced settings for hosting
 const db = mysql.createPool({
   host: process.env.DB_HOST || 'localhost',
   user: process.env.DB_USER || 'akaydin',
   password: process.env.DB_PASSWORD || '518518',
   database: process.env.DB_NAME || 'akaydin_tarim',
   waitForConnections: true,
-  connectionLimit: 5,
+  connectionLimit: 2,
   queueLimit: 0,
-  acquireTimeout: 60000,
-  timeout: 60000
+  acquireTimeout: 30000,
+  timeout: 30000,
+  idleTimeout: 30000
 });
 
 // Test endpoint
